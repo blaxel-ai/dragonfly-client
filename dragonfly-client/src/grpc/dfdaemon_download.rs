@@ -39,7 +39,7 @@ use dragonfly_api::dfdaemon::v2::{
     StatLocalPersistentTaskResponse, StatLocalTaskRequest, StatLocalTaskResponse,
     StatPersistentCacheTaskRequest, StatPersistentTaskRequest,
     StatTaskRequest as DfdaemonStatTaskRequest, UploadPersistentCacheTaskRequest,
-    UploadPersistentTaskRequest,
+    ExemptTaskFromGcRequest, UploadPersistentTaskRequest,
 };
 use dragonfly_api::errordetails::v2::Backend;
 use dragonfly_api::scheduler::v2::DeleteHostRequest as SchedulerDeleteHostRequest;
@@ -2275,6 +2275,37 @@ impl DfdaemonDownload for DfdaemonDownloadServerHandler {
                 Err(Status::internal(err.to_string()))
             }
         }
+    }
+
+    /// Sets or clears the garbage collection exemption flag on a task.
+    #[instrument(skip_all, fields(task_id))]
+    async fn exempt_task_from_gc(
+        &self,
+        request: Request<ExemptTaskFromGcRequest>,
+    ) -> Result<Response<()>, Status> {
+        // If the parent context is set, use it as the parent context for the span.
+        if let Some(parent_ctx) = request.extensions().get::<Context>() {
+            let _ = Span::current().set_parent(parent_ctx.clone());
+        };
+
+        let request = request.into_inner();
+        let task_id = request.task_id;
+
+        // Span record the task id.
+        Span::current().record("task_id", task_id.as_str());
+        info!(
+            "set gc exemption to {} for task in download server",
+            request.exempt
+        );
+
+        self.task
+            .set_gc_exempt(task_id.as_str(), request.exempt)
+            .map_err(|err| {
+                error!("set gc exemption for task {}: {}", task_id, err);
+                Status::internal(err.to_string())
+            })?;
+
+        Ok(Response::new(()))
     }
 
     /// Download cache task stream is the stream of the download cache task response.

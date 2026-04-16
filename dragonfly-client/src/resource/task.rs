@@ -2089,6 +2089,17 @@ impl Task {
         })
     }
 
+    /// Set the exempt_from_gc flag on a task.
+    #[instrument(skip_all)]
+    pub fn set_gc_exempt(&self, task_id: &str, exempt: bool) -> ClientResult<()> {
+        self.storage.set_task_gc_exempt(task_id, exempt)?;
+        info!(
+            "set task {} gc exemption to {}",
+            task_id, exempt
+        );
+        Ok(())
+    }
+
     /// Delete a task and reclaim local storage.
     #[instrument(skip_all)]
     pub async fn delete(&self, task_id: &str, host_id: &str) -> ClientResult<()> {

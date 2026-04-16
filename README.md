@@ -15,3 +15,19 @@ Much of the automated GitHub-specific infrastructure (dependabot, release workfl
 has been removed from this fork.
 The idea is to instead rely on the upstream repository to incorporate dependabot suggestions
 and rebase on those changes here.
+
+### Releasing
+
+The fork uses a simplified [release action](.github/workflows/release.yml)
+that simply uploads pre-built x86-64 Linux binaries for each tool as a tarball.
+
+In order to trigger the release process,
+create a tag of the form `vX.Y.Z-blaxel[.R]` at the commit where you want to build the binaries,
+where `X.Y.Z` is the tag of the latest upstream commit
+and `[.R]` is an optional revision number (in case there are several forked version built off a single upstream version),
+then push the new tag to the Blaxel fork repository,
+and trigger the workflow manually:
+
+```bash
+gh workflow run release.yml --ref blaxel-fork -f tag=vX.Y.Z-blaxel
+```

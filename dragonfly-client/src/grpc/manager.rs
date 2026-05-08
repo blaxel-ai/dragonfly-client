@@ -20,10 +20,7 @@ use dragonfly_api::manager::v2::{
     ListSchedulersRequest, ListSchedulersResponse, SeedPeer, UpdateSeedPeerRequest,
 };
 use dragonfly_client_config::dfdaemon::Config;
-use dragonfly_client_core::{
-    error::{ErrorType, OrErr},
-    Error, Result,
-};
+use dragonfly_client_core::{Error, Result};
 use std::sync::Arc;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -51,13 +48,28 @@ impl ManagerClient {
                 error!("invalid address: {}", addr);
             })?
             .to_string();
+        let addr = if config.manager.tls {
+            addr.replacen("http://", "https://", 1)
+        } else {
+            addr
+        };
 
-        let client_tls_config = config
-            .manager
-            .load_client_tls_config(domain_name.as_str())
-            .await?;
+        let skip_tls_verification = config.manager.tls && config.manager.skip_tls_verification;
+        let client_tls_config = if skip_tls_verification {
+            None
+        } else {
+            config
+                .manager
+                .load_client_tls_config(domain_name.as_str())
+                .await?
+        };
 
-        let health_client = HealthClient::new(addr.as_str(), client_tls_config.clone()).await?;
+        let health_client = HealthClient::new(
+            addr.as_str(),
+            client_tls_config.clone(),
+            skip_tls_verification,
+        )
+        .await?;
         match health_client.check().await {
             Ok(resp) => {
                 if resp.status != ServingStatus::Serving as i32 {
@@ -67,37 +79,20 @@ impl ManagerClient {
             Err(err) => return Err(err),
         }
 
-        let channel = match client_tls_config {
-            Some(client_tls_config) => Channel::from_shared(addr.clone())
-                .map_err(|_| Error::InvalidURI(addr.clone()))?
-                .tls_config(client_tls_config)?
-                .buffer_size(super::BUFFER_SIZE)
-                .connect_timeout(super::CONNECT_TIMEOUT)
-                .timeout(super::REQUEST_TIMEOUT)
-                .tcp_keepalive(Some(super::TCP_KEEPALIVE))
-                .http2_keep_alive_interval(super::HTTP2_KEEP_ALIVE_INTERVAL)
-                .keep_alive_timeout(super::HTTP2_KEEP_ALIVE_TIMEOUT)
-                .connect()
+        let endpoint = Channel::from_shared(addr.clone())
+            .map_err(|_| Error::InvalidURI(addr.clone()))?
+            .buffer_size(super::BUFFER_SIZE)
+            .connect_timeout(super::CONNECT_TIMEOUT)
+            .timeout(super::REQUEST_TIMEOUT)
+            .tcp_keepalive(Some(super::TCP_KEEPALIVE))
+            .http2_keep_alive_interval(super::HTTP2_KEEP_ALIVE_INTERVAL)
+            .keep_alive_timeout(super::HTTP2_KEEP_ALIVE_TIMEOUT);
+        let channel =
+            super::connect_channel(endpoint, client_tls_config, skip_tls_verification)
                 .await
                 .inspect_err(|err| {
-                    error!("connect to {} failed: {}", addr.to_string(), err);
-                })
-                .or_err(ErrorType::ConnectError)?,
-            None => Channel::from_shared(addr.clone())
-                .map_err(|_| Error::InvalidURI(addr.clone()))?
-                .buffer_size(super::BUFFER_SIZE)
-                .connect_timeout(super::CONNECT_TIMEOUT)
-                .timeout(super::REQUEST_TIMEOUT)
-                .tcp_keepalive(Some(super::TCP_KEEPALIVE))
-                .http2_keep_alive_interval(super::HTTP2_KEEP_ALIVE_INTERVAL)
-                .keep_alive_timeout(super::HTTP2_KEEP_ALIVE_TIMEOUT)
-                .connect()
-                .await
-                .inspect_err(|err| {
-                    error!("connect to {} failed: {}", addr.to_string(), err);
-                })
-                .or_err(ErrorType::ConnectError)?,
-        };
+                    error!("connect to {} failed: {}", addr, err);
+                })?;
 
         let client = ManagerGRPCClient::with_interceptor(channel, InjectTracingInterceptor)
             .max_decoding_message_size(usize::MAX)

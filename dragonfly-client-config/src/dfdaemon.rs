@@ -687,6 +687,12 @@ pub struct Manager {
     /// Address is the manager address.
     pub addr: String,
 
+    /// Tls indicates whether to connect to the manager over TLS (https).
+    pub tls: bool,
+
+    /// Skip TLS certificate verification when connecting to the manager.
+    pub skip_tls_verification: bool,
+
     /// CA cert is the root CA cert path with PEM format for the manager, and it is used
     /// for mutual TLS.
     pub ca_cert: Option<PathBuf>,
@@ -723,6 +729,14 @@ impl Manager {
                     .domain_name(domain_name)
                     .ca_certificate(ca_cert)
                     .identity(client_identity),
+            ));
+        }
+
+        if self.tls {
+            return Ok(Some(
+                ClientTlsConfig::new()
+                    .domain_name(domain_name)
+                    .with_enabled_roots(),
             ));
         }
 
@@ -783,6 +797,12 @@ pub struct Scheduler {
     #[validate(range(min = 1))]
     pub max_schedule_count: u32,
 
+    /// Tls indicates whether to connect to the scheduler over TLS (https).
+    pub tls: bool,
+
+    /// Skip TLS certificate verification when connecting to the scheduler.
+    pub skip_tls_verification: bool,
+
     /// CA cert is the root CA cert path with PEM format for the scheduler, and it is used
     /// for mutual TLS.
     pub ca_cert: Option<PathBuf>,
@@ -803,6 +823,8 @@ impl Default for Scheduler {
             announce_interval: default_scheduler_announce_interval(),
             schedule_timeout: default_scheduler_schedule_timeout(),
             max_schedule_count: default_download_max_schedule_count(),
+            tls: false,
+            skip_tls_verification: false,
             ca_cert: None,
             cert: None,
             key: None,
@@ -833,6 +855,14 @@ impl Scheduler {
                     .domain_name(domain_name)
                     .ca_certificate(ca_cert)
                     .identity(client_identity),
+            ));
+        }
+
+        if self.tls {
+            return Ok(Some(
+                ClientTlsConfig::new()
+                    .domain_name(domain_name)
+                    .with_enabled_roots(),
             ));
         }
 
@@ -1973,6 +2003,8 @@ mod tests {
 
         let manager = Manager {
             addr: "http://example.com".to_string(),
+            tls: false,
+            skip_tls_verification: false,
             ca_cert: Some(ca_path),
             cert: Some(cert_path),
             key: Some(key_path),
@@ -2001,6 +2033,7 @@ addr: http://another-service:8080
     fn deserialize_manager_correctly() {
         let yaml = r#"
 addr: http://manager-service:65003
+tls: true
 caCert: /etc/ssl/certs/ca.crt
 cert: /etc/ssl/certs/client.crt
 key: /etc/ssl/private/client.pem
@@ -2008,6 +2041,7 @@ key: /etc/ssl/private/client.pem
 
         let manager: Manager = serde_yaml::from_str(yaml).expect("Failed to deserialize");
         assert_eq!(manager.addr, "http://manager-service:65003");
+        assert!(manager.tls);
         assert_eq!(
             manager.ca_cert,
             Some(PathBuf::from("/etc/ssl/certs/ca.crt"))
@@ -2020,6 +2054,65 @@ key: /etc/ssl/private/client.pem
             manager.key,
             Some(PathBuf::from("/etc/ssl/private/client.pem"))
         );
+    }
+
+    #[test]
+    fn manager_tls_defaults_to_false() {
+        let manager = Manager::default();
+        assert!(!manager.tls);
+
+        let yaml = "addr: http://manager-service:65003\n";
+        let manager: Manager = serde_yaml::from_str(yaml).unwrap();
+        assert!(!manager.tls);
+    }
+
+    #[test]
+    fn scheduler_tls_defaults_to_false() {
+        let scheduler = Scheduler::default();
+        assert!(!scheduler.tls);
+
+        let scheduler: Scheduler = serde_yaml::from_str("{}").unwrap();
+        assert!(!scheduler.tls);
+    }
+
+    #[test]
+    fn deserialize_scheduler_tls_fields() {
+        let yaml = r#"
+tls: true
+"#;
+        let scheduler: Scheduler = serde_yaml::from_str(yaml).expect("Failed to deserialize");
+        assert!(scheduler.tls);
+    }
+
+    #[tokio::test]
+    async fn scheduler_load_client_tls_config_success() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let ca_path = temp_dir.path().join("ca.crt");
+        let cert_path = temp_dir.path().join("client.crt");
+        let key_path = temp_dir.path().join("client.key");
+
+        fs::write(&ca_path, "CA cert content").await.unwrap();
+        fs::write(&cert_path, "Client cert content").await.unwrap();
+        fs::write(&key_path, "Client key content").await.unwrap();
+
+        let scheduler = Scheduler {
+            ca_cert: Some(ca_path),
+            cert: Some(cert_path),
+            key: Some(key_path),
+            ..Default::default()
+        };
+
+        let result = scheduler.load_client_tls_config("example.com").await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn scheduler_load_client_tls_config_returns_none_without_certs() {
+        let scheduler = Scheduler::default();
+        let result = scheduler.load_client_tls_config("example.com").await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 
     #[test]

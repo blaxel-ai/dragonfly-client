@@ -19,6 +19,7 @@ use dragonfly_client_core::{
     Error, Result,
 };
 use hyper_util::rt::TokioIo;
+use std::error::Error as StdError;
 use std::path::PathBuf;
 use tokio::net::UnixStream;
 use tonic::service::interceptor::InterceptedService;
@@ -42,36 +43,28 @@ pub struct HealthClient {
 /// HealthClient implements the grpc client of the health.
 impl HealthClient {
     /// new creates a new HealthClient.
-    pub async fn new(addr: &str, client_tls_config: Option<ClientTlsConfig>) -> Result<Self> {
-        let channel = match client_tls_config {
-            Some(client_tls_config) => Channel::from_shared(addr.to_string())
-                .map_err(|_| Error::InvalidURI(addr.into()))?
-                .tls_config(client_tls_config)?
-                .connect_timeout(super::CONNECT_TIMEOUT)
-                .timeout(super::REQUEST_TIMEOUT)
-                .tcp_keepalive(Some(super::TCP_KEEPALIVE))
-                .http2_keep_alive_interval(super::HTTP2_KEEP_ALIVE_INTERVAL)
-                .keep_alive_timeout(super::HTTP2_KEEP_ALIVE_TIMEOUT)
-                .connect()
-                .await
-                .inspect_err(|err| {
-                    error!("connect to {} failed: {}", addr, err);
-                })
-                .or_err(ErrorType::ConnectError)?,
-            None => Channel::from_shared(addr.to_string())
-                .map_err(|_| Error::InvalidURI(addr.into()))?
-                .connect_timeout(super::CONNECT_TIMEOUT)
-                .timeout(super::REQUEST_TIMEOUT)
-                .tcp_keepalive(Some(super::TCP_KEEPALIVE))
-                .http2_keep_alive_interval(super::HTTP2_KEEP_ALIVE_INTERVAL)
-                .keep_alive_timeout(super::HTTP2_KEEP_ALIVE_TIMEOUT)
-                .connect()
-                .await
-                .inspect_err(|err| {
-                    error!("connect to {} failed: {}", addr, err);
-                })
-                .or_err(ErrorType::ConnectError)?,
-        };
+    pub async fn new(
+        addr: &str,
+        client_tls_config: Option<ClientTlsConfig>,
+        skip_tls_verification: bool,
+    ) -> Result<Self> {
+        let endpoint = Channel::from_shared(addr.to_string())
+            .map_err(|_| Error::InvalidURI(addr.into()))?
+            .connect_timeout(super::CONNECT_TIMEOUT)
+            .timeout(super::REQUEST_TIMEOUT)
+            .tcp_keepalive(Some(super::TCP_KEEPALIVE))
+            .http2_keep_alive_interval(super::HTTP2_KEEP_ALIVE_INTERVAL)
+            .keep_alive_timeout(super::HTTP2_KEEP_ALIVE_TIMEOUT);
+        let channel = super::connect_channel(endpoint, client_tls_config, skip_tls_verification)
+            .await
+            .inspect_err(|err| {
+                error!("connect to {} failed: {}", addr, err);
+                let mut source = err.source();
+                while let Some(err) = source {
+                    error!("connect to {} failed, caused by: {}", addr, err);
+                    source = err.source();
+                }
+            })?;
 
         let client = HealthGRPCClient::with_interceptor(channel, InjectTracingInterceptor)
             .max_decoding_message_size(usize::MAX)
@@ -141,5 +134,85 @@ impl HealthClient {
         let mut request = tonic::Request::new(request);
         request.set_timeout(super::REQUEST_TIMEOUT);
         request
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HealthClient;
+    use std::net::SocketAddr;
+    use tokio::net::TcpListener;
+    use tonic::transport::server::TcpIncoming;
+    use tonic::transport::Server;
+
+    /// Starts a cleartext gRPC server with the standard health service on a random local port.
+    /// Returns the bound address.
+    async fn start_cleartext_health_server() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = TcpIncoming::from(listener);
+        let (_reporter, service) = tonic_health::server::health_reporter();
+
+        tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(service)
+                .serve_with_incoming(incoming)
+                .await;
+        });
+
+        addr
+    }
+
+    /// Starts a plain TCP listener that accepts connections and immediately drops them.
+    async fn start_dropping_tcp_listener() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        addr
+    }
+
+    #[tokio::test]
+    async fn cleartext_connect_succeeds_when_tls_disabled() {
+        let addr = start_cleartext_health_server().await;
+        let url = format!("http://{}", addr);
+
+        let result = HealthClient::new(&url, None, false).await;
+        assert!(
+            result.is_ok(),
+            "cleartext connect to cleartext gRPC server should succeed: {:?}",
+            result.err(),
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_connect_fails_against_cleartext_server() {
+        let addr = start_cleartext_health_server().await;
+        let url = format!("https://{}", addr);
+
+        let result = HealthClient::new(&url, None, false).await;
+        assert!(
+            result.is_err(),
+            "TLS handshake should fail against a cleartext gRPC server",
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_connect_fails_against_dropping_tcp_listener() {
+        let addr = start_dropping_tcp_listener().await;
+        let url = format!("https://{}", addr);
+
+        let result = HealthClient::new(&url, None, false).await;
+        assert!(
+            result.is_err(),
+            "TLS handshake should fail against a non-TLS TCP listener",
+        );
     }
 }

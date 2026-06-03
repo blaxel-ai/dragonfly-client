@@ -72,8 +72,9 @@ impl Memory {
     /// # Returns
     /// MemoryStats containing total, free, available, used memory and usage percentage.
     pub fn get_stats(&self) -> MemoryStats {
-        let sys =
-            System::new_with_specifics(RefreshKind::new().with_memory(MemoryRefreshKind::new()));
+        let sys = System::new_with_specifics(
+            RefreshKind::new().with_memory(MemoryRefreshKind::new().with_ram()),
+        );
         let total_memory = sys.total_memory();
         let free_memory = sys.free_memory();
         let available_memory = sys.available_memory();

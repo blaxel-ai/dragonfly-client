@@ -56,21 +56,56 @@ use leaky_bucket::RateLimiter;
 use reqwest::header::HeaderMap;
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{
     mpsc::{self, Sender},
     Mutex, Semaphore,
 };
 use tokio::task::JoinSet;
+use tokio::time::{self, MissedTickBehavior};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::{Request, Status};
 use tracing::{debug, error, info, instrument, warn, Instrument};
 
 use super::*;
+
+const MIN_P2P_THROUGHPUT_GRACE_PERIOD: Duration = Duration::from_secs(3);
+const MIN_P2P_THROUGHPUT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+struct ParentDownloadResult {
+    finished_pieces: Vec<metadata::Piece>,
+    should_back_to_source: bool,
+}
+
+fn elapsed_deciseconds(elapsed: Duration) -> u64 {
+    elapsed.as_secs() * 10 + (elapsed.subsec_millis() / 100) as u64
+}
+
+fn bytes_per_second(downloaded_bytes: u64, elapsed: Duration) -> u64 {
+    let deciseconds = elapsed_deciseconds(elapsed);
+    if deciseconds == 0 {
+        return 0;
+    }
+
+    downloaded_bytes.saturating_mul(10) / deciseconds
+}
+
+fn is_p2p_throughput_below_min(
+    downloaded_bytes: u64,
+    elapsed: Duration,
+    min_bytes_per_second: u64,
+) -> bool {
+    if min_bytes_per_second == 0 || elapsed <= MIN_P2P_THROUGHPUT_GRACE_PERIOD {
+        return false;
+    }
+
+    downloaded_bytes.saturating_mul(10)
+        < min_bytes_per_second.saturating_mul(elapsed_deciseconds(elapsed))
+}
 
 /// Task represents a task manager.
 pub struct Task {
@@ -459,6 +494,8 @@ impl Task {
         debug!("download the pieces with scheduler");
 
         // Download the pieces with scheduler.
+        let p2p_started_at = Instant::now();
+        let p2p_finished_bytes = Arc::new(AtomicU64::new(0));
         let finished_pieces = match self
             .download_partial_with_scheduler(
                 task,
@@ -467,6 +504,8 @@ impl Task {
                 interested_pieces.clone(),
                 request.clone(),
                 download_progress_tx.clone(),
+                p2p_started_at,
+                p2p_finished_bytes,
             )
             .await
         {
@@ -559,6 +598,8 @@ impl Task {
         interested_pieces: Vec<metadata::Piece>,
         request: Download,
         download_progress_tx: Sender<Result<DownloadTaskResponse, Status>>,
+        p2p_started_at: Instant,
+        p2p_finished_bytes: Arc<AtomicU64>,
     ) -> ClientResult<Vec<metadata::Piece>> {
         // Get the id of the task.
         let task_id = task.id.as_str();
@@ -739,7 +780,7 @@ impl Task {
                     );
 
                     // Download the pieces from the parent.
-                    let partial_finished_pieces = match self
+                    let parent_download_result = match self
                         .download_partial_with_scheduler_from_parent(
                             task,
                             host_id,
@@ -750,29 +791,67 @@ impl Task {
                             request.need_piece_content,
                             download_progress_tx.clone(),
                             in_stream_tx.clone(),
+                            p2p_started_at,
+                            p2p_finished_bytes.clone(),
                         )
                         .await
                     {
-                        Ok(partial_finished_pieces) => {
+                        Ok(parent_download_result) => {
                             debug!(
                                 "schedule {} finished {} pieces from parent",
                                 schedule_count,
-                                partial_finished_pieces.len()
+                                parent_download_result.finished_pieces.len()
                             );
 
-                            partial_finished_pieces
+                            parent_download_result
                         }
                         Err(err) => {
                             error!("download from parent error: {:?}", err);
-                            Vec::new()
+                            ParentDownloadResult {
+                                finished_pieces: Vec::new(),
+                                should_back_to_source: false,
+                            }
                         }
                     };
 
                     // Merge the finished pieces.
                     finished_pieces = self.piece.merge_finished_pieces(
                         finished_pieces.clone(),
-                        partial_finished_pieces.clone(),
+                        parent_download_result.finished_pieces.clone(),
                     );
+
+                    if parent_download_result.should_back_to_source {
+                        match in_stream_tx
+                            .send_timeout(
+                                AnnouncePeerRequest {
+                                    host_id: host_id.to_string(),
+                                    task_id: task_id.to_string(),
+                                    peer_id: peer_id.to_string(),
+                                    request: Some(
+                                        announce_peer_request::Request::DownloadPeerFailedRequest(
+                                            DownloadPeerFailedRequest {
+                                                description: Some(
+                                                    "p2p throughput is below minP2pThroughput"
+                                                        .to_string(),
+                                                ),
+                                            },
+                                        ),
+                                    ),
+                                },
+                                REQUEST_TIMEOUT,
+                            )
+                            .await
+                        {
+                            Ok(_) => debug!("sent DownloadPeerFailedRequest"),
+                            Err(err) => {
+                                error!("send DownloadPeerFailedRequest failed: {:?}", err);
+                            }
+                        }
+
+                        // Wait for the latest message to be sent.
+                        in_stream_tx.closed().await;
+                        return Ok(finished_pieces);
+                    }
 
                     // Check if all pieces are downloaded.
                     if finished_pieces.len() == interested_pieces.len() {
@@ -987,7 +1066,9 @@ impl Task {
         need_piece_content: bool,
         download_progress_tx: Sender<Result<DownloadTaskResponse, Status>>,
         in_stream_tx: Sender<AnnouncePeerRequest>,
-    ) -> ClientResult<Vec<metadata::Piece>> {
+        p2p_started_at: Instant,
+        p2p_finished_bytes: Arc<AtomicU64>,
+    ) -> ClientResult<ParentDownloadResult> {
         // Get the id of the task.
         let task_id = task.id.as_str();
 
@@ -1038,16 +1119,25 @@ impl Task {
         let semaphore = Arc::new(Semaphore::new(
             self.config.download.concurrent_piece_count as usize,
         ));
+        let min_p2p_throughput = self.config.download.min_p2p_throughput.as_u64();
+        let mut throughput_check_interval = time::interval(MIN_P2P_THROUGHPUT_CHECK_INTERVAL);
+        throughput_check_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-        while let Some(collect_piece) = piece_collector_rx.recv().await {
-            if interrupt.load(Ordering::SeqCst) {
-                // If the interrupt is true, break the collector loop.
-                debug!("interrupt the piece collector");
-                drop(piece_collector_rx);
-                break;
-            }
+        loop {
+            tokio::select! {
+                collect_piece = piece_collector_rx.recv() => {
+                    let Some(collect_piece) = collect_piece else {
+                        break;
+                    };
 
-            async fn download_from_parent(
+                    if interrupt.load(Ordering::SeqCst) {
+                        // If the interrupt is true, break the collector loop.
+                        debug!("interrupt the piece collector");
+                        drop(piece_collector_rx);
+                        break;
+                    }
+
+                    async fn download_from_parent(
                 task_id: String,
                 host_id: String,
                 peer_id: String,
@@ -1059,6 +1149,7 @@ impl Task {
                 in_stream_tx: Sender<AnnouncePeerRequest>,
                 interrupt: Arc<AtomicBool>,
                 finished_pieces: Arc<Mutex<Vec<metadata::Piece>>>,
+                p2p_finished_bytes: Arc<AtomicU64>,
                 is_prefetch: bool,
                 need_piece_content: bool,
                 protocol: String,
@@ -1222,45 +1313,77 @@ impl Task {
 
                 let mut finished_pieces = finished_pieces.lock().await;
                 finished_pieces.push(metadata.clone());
+                p2p_finished_bytes.fetch_add(metadata.length, Ordering::Relaxed);
 
                 Ok(metadata)
             }
 
-            let task_id = task_id.to_string();
-            let host_id = host_id.to_string();
-            let peer_id = peer_id.to_string();
-            let piece_manager = self.piece.clone();
-            let download_progress_tx = download_progress_tx.clone();
-            let in_stream_tx = in_stream_tx.clone();
-            let interrupt = interrupt.clone();
-            let finished_pieces = finished_pieces.clone();
-            let protocol = self.config.download.protocol.clone();
-            let parent_selector = self.parent_selector.clone();
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
-            join_set.spawn(
-                async move {
-                    let _permit = permit;
-                    download_from_parent(
-                        task_id,
-                        host_id,
-                        peer_id,
-                        collect_piece.number,
-                        collect_piece.length,
-                        collect_piece.parents,
-                        piece_manager,
-                        download_progress_tx,
-                        in_stream_tx,
-                        interrupt,
-                        finished_pieces,
-                        is_prefetch,
-                        need_piece_content,
-                        protocol,
-                        parent_selector,
-                    )
-                    .await
+                    let task_id = task_id.to_string();
+                    let host_id = host_id.to_string();
+                    let peer_id = peer_id.to_string();
+                    let piece_manager = self.piece.clone();
+                    let download_progress_tx = download_progress_tx.clone();
+                    let in_stream_tx = in_stream_tx.clone();
+                    let interrupt = interrupt.clone();
+                    let finished_pieces = finished_pieces.clone();
+                    let p2p_finished_bytes = p2p_finished_bytes.clone();
+                    let protocol = self.config.download.protocol.clone();
+                    let parent_selector = self.parent_selector.clone();
+                    let permit = semaphore.clone().acquire_owned().await.unwrap();
+                    join_set.spawn(
+                        async move {
+                            let _permit = permit;
+                            download_from_parent(
+                                task_id,
+                                host_id,
+                                peer_id,
+                                collect_piece.number,
+                                collect_piece.length,
+                                collect_piece.parents,
+                                piece_manager,
+                                download_progress_tx,
+                                in_stream_tx,
+                                interrupt,
+                                finished_pieces,
+                                p2p_finished_bytes,
+                                is_prefetch,
+                                need_piece_content,
+                                protocol,
+                                parent_selector,
+                            )
+                            .await
+                        }
+                        .in_current_span(),
+                    );
                 }
-                .in_current_span(),
-            );
+                _ = throughput_check_interval.tick(), if min_p2p_throughput > 0 => {
+                    let elapsed = p2p_started_at.elapsed();
+                    let downloaded_bytes = p2p_finished_bytes.load(Ordering::Relaxed);
+
+                    if is_p2p_throughput_below_min(
+                        downloaded_bytes,
+                        elapsed,
+                        min_p2p_throughput,
+                    ) {
+                        warn!(
+                            "p2p throughput {} B/s is below minP2pThroughput {} B/s after {:?}, falling back to source",
+                            bytes_per_second(downloaded_bytes, elapsed),
+                            min_p2p_throughput,
+                            elapsed
+                        );
+
+                        interrupt.store(true, Ordering::SeqCst);
+                        drop(piece_collector_rx);
+                        join_set.shutdown().await;
+
+                        let finished_pieces = finished_pieces.lock().await.clone();
+                        return Ok(ParentDownloadResult {
+                            finished_pieces,
+                            should_back_to_source: true,
+                        });
+                    }
+                }
+            }
         }
 
         // Wait for the pieces to be downloaded.
@@ -1314,7 +1437,10 @@ impl Task {
                     // It will stop the download from the parent with scheduler
                     // and download from the source directly from middle.
                     let finished_pieces = finished_pieces.lock().await.clone();
-                    return Ok(finished_pieces);
+                    return Ok(ParentDownloadResult {
+                        finished_pieces,
+                        should_back_to_source: false,
+                    });
                 }
                 Err(err) => {
                     error!("download from parent error: {:?}", err);
@@ -1327,7 +1453,10 @@ impl Task {
         }
 
         let finished_pieces = finished_pieces.lock().await.clone();
-        Ok(finished_pieces)
+        Ok(ParentDownloadResult {
+            finished_pieces,
+            should_back_to_source: false,
+        })
     }
 
     /// download_partial_with_scheduler_from_source downloads a partial task with scheduler from the source.
@@ -2093,10 +2222,7 @@ impl Task {
     #[instrument(skip_all)]
     pub fn set_gc_exempt(&self, task_id: &str, exempt: bool) -> ClientResult<()> {
         self.storage.set_task_gc_exempt(task_id, exempt)?;
-        info!(
-            "set task {} gc exemption to {}",
-            task_id, exempt
-        );
+        info!("set task {} gc exemption to {}", task_id, exempt);
         Ok(())
     }
 
@@ -2157,6 +2283,42 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::tempdir;
+
+    #[test]
+    fn p2p_throughput_check_is_disabled_by_zero_threshold() {
+        assert!(!is_p2p_throughput_below_min(
+            0,
+            MIN_P2P_THROUGHPUT_GRACE_PERIOD + Duration::from_secs(1),
+            0,
+        ));
+    }
+
+    #[test]
+    fn p2p_throughput_check_allows_grace_period() {
+        assert!(!is_p2p_throughput_below_min(
+            0,
+            MIN_P2P_THROUGHPUT_GRACE_PERIOD,
+            1,
+        ));
+    }
+
+    #[test]
+    fn p2p_throughput_check_detects_below_threshold() {
+        assert!(is_p2p_throughput_below_min(
+            2 * 1024 * 1024,
+            Duration::from_secs(4),
+            1024 * 1024,
+        ));
+    }
+
+    #[test]
+    fn p2p_throughput_check_allows_equal_threshold() {
+        assert!(!is_p2p_throughput_below_min(
+            4 * 1024 * 1024,
+            Duration::from_secs(4),
+            1024 * 1024,
+        ));
+    }
 
     // test_delete_task_not_found tests the Task.delete method when the task does not exist.
     #[tokio::test]

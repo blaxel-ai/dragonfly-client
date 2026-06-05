@@ -152,6 +152,12 @@ fn default_back_to_source_bandwidth_limit() -> ByteSize {
     ByteSize::gb(50)
 }
 
+/// default_min_p2p_throughput is the default minimum p2p download throughput in GB/MB/KB per second, default is 0B/s.
+#[inline]
+fn default_min_p2p_throughput() -> ByteSize {
+    ByteSize::b(0)
+}
+
 /// default_download_piece_timeout is the default timeout for downloading a piece from source.
 #[inline]
 fn default_download_piece_timeout() -> Duration {
@@ -489,6 +495,11 @@ pub struct Download {
     )]
     pub back_to_source_bandwidth_limit: ByteSize,
 
+    /// Min p2p throughput is the minimum p2p download throughput in GB/MB/KB per second.
+    /// If the throughput is below this value after a short grace period, dfdaemon falls back to source.
+    #[serde(with = "bytesize_serde", default = "default_min_p2p_throughput")]
+    pub min_p2p_throughput: ByteSize,
+
     /// Piece timeout is the timeout for downloading a piece from source.
     #[serde(default = "default_download_piece_timeout", with = "humantime_serde")]
     pub piece_timeout: Duration,
@@ -515,6 +526,7 @@ impl Default for Download {
             protocol: default_download_protocol(),
             bandwidth_limit: default_download_bandwidth_limit(),
             back_to_source_bandwidth_limit: default_back_to_source_bandwidth_limit(),
+            min_p2p_throughput: default_min_p2p_throughput(),
             piece_timeout: default_download_piece_timeout(),
             collected_piece_timeout: default_collected_download_piece_timeout(),
             concurrent_piece_count: default_download_concurrent_piece_count(),
@@ -1812,6 +1824,7 @@ mod tests {
             },
             "protocol": "quic",
             "bandwidthLimit": "50GB",
+            "minP2pThroughput": "10MiB",
             "pieceTimeout": "30s",
             "concurrentPieceCount": 10
         }"#;
@@ -1824,6 +1837,7 @@ mod tests {
         assert_eq!(download.server.request_rate_limit, 4000);
         assert_eq!(download.protocol, "quic".to_string());
         assert_eq!(download.bandwidth_limit, ByteSize::gb(50));
+        assert_eq!(download.min_p2p_throughput, ByteSize::mib(10));
         assert_eq!(download.piece_timeout, Duration::from_secs(30));
         assert_eq!(download.concurrent_piece_count, 10);
     }

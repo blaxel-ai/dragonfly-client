@@ -177,7 +177,11 @@ impl Local {
         let mut available_schedulers: Vec<ManagerScheduler> = Vec::new();
         for scheduler in schedulers {
             let addr = format_url(
-                "http",
+                if self.config.scheduler.tls {
+                    "https"
+                } else {
+                    "http"
+                },
                 IpAddr::from_str(&scheduler.ip)?,
                 scheduler.port as u16,
             );
@@ -189,25 +193,29 @@ impl Local {
                 })?
                 .to_string();
 
-            // Check the health of the scheduler.
-            let health_client = match HealthClient::new(
-                &addr,
+            let skip_tls_verification =
+                self.config.scheduler.tls && self.config.scheduler.skip_tls_verification;
+            let client_tls_config = if skip_tls_verification {
+                None
+            } else {
                 self.config
                     .scheduler
                     .load_client_tls_config(domain_name.as_str())
-                    .await?,
-            )
-            .await
-            {
-                Ok(client) => client,
-                Err(err) => {
-                    error!(
-                        "create health client for scheduler {}:{} failed: {}",
-                        scheduler.ip, scheduler.port, err
-                    );
-                    continue;
-                }
+                    .await?
             };
+
+            // Check the health of the scheduler.
+            let health_client =
+                match HealthClient::new(&addr, client_tls_config, skip_tls_verification).await {
+                    Ok(client) => client,
+                    Err(err) => {
+                        error!(
+                            "create health client for scheduler {}:{} failed: {}",
+                            scheduler.ip, scheduler.port, err
+                        );
+                        continue;
+                    }
+                };
 
             match health_client.check().await {
                 Ok(resp) => {

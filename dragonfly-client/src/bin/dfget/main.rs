@@ -914,6 +914,8 @@ async fn download(
                 hdfs,
                 hugging_face,
                 model_scope,
+                // ponytail: dfget exposes no OpenCSG flags, the field is left unset.
+                open_csg: None,
                 force_hard_link: args.force_hard_link,
                 content_for_calculating_task_id: args.content_for_calculating_task_id,
                 remote_ip: preferred_local_ip().map(|ip| ip.to_string()),
@@ -1142,6 +1144,7 @@ async fn get_entries(
             hdfs,
             hugging_face,
             model_scope,
+            open_csg: None,
             remote_ip: preferred_local_ip().map(|ip| ip.to_string()),
         })
         .await

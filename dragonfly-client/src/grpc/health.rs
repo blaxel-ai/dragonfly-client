@@ -42,36 +42,24 @@ pub struct HealthClient {
 /// Implements the grpc client of the health.
 impl HealthClient {
     /// Creates a new HealthClient.
-    pub async fn new(addr: &str, client_tls_config: Option<ClientTlsConfig>) -> Result<Self> {
-        let channel = match client_tls_config {
-            Some(client_tls_config) => Channel::from_shared(addr.to_string())
-                .map_err(|_| Error::InvalidURI(addr.into()))?
-                .tls_config(client_tls_config)?
-                .connect_timeout(super::CONNECT_TIMEOUT)
-                .timeout(super::REQUEST_TIMEOUT)
-                .tcp_keepalive(Some(super::TCP_KEEPALIVE))
-                .http2_keep_alive_interval(super::HTTP2_KEEP_ALIVE_INTERVAL)
-                .keep_alive_timeout(super::HTTP2_KEEP_ALIVE_TIMEOUT)
-                .connect()
-                .await
-                .inspect_err(|err| {
-                    error!("connect to {} failed: {}", addr, err);
-                })
-                .or_err(ErrorType::ConnectError)?,
-            None => Channel::from_shared(addr.to_string())
-                .map_err(|_| Error::InvalidURI(addr.into()))?
-                .connect_timeout(super::CONNECT_TIMEOUT)
-                .timeout(super::REQUEST_TIMEOUT)
-                .tcp_keepalive(Some(super::TCP_KEEPALIVE))
-                .http2_keep_alive_interval(super::HTTP2_KEEP_ALIVE_INTERVAL)
-                .keep_alive_timeout(super::HTTP2_KEEP_ALIVE_TIMEOUT)
-                .connect()
-                .await
-                .inspect_err(|err| {
-                    error!("connect to {} failed: {}", addr, err);
-                })
-                .or_err(ErrorType::ConnectError)?,
-        };
+    pub async fn new(
+        addr: &str,
+        client_tls_config: Option<ClientTlsConfig>,
+        skip_tls_verification: bool,
+    ) -> Result<Self> {
+        let endpoint = Channel::from_shared(addr.to_string())
+            .map_err(|_| Error::InvalidURI(addr.into()))?
+            .connect_timeout(super::CONNECT_TIMEOUT)
+            .timeout(super::REQUEST_TIMEOUT)
+            .tcp_keepalive(Some(super::TCP_KEEPALIVE))
+            .http2_keep_alive_interval(super::HTTP2_KEEP_ALIVE_INTERVAL)
+            .keep_alive_timeout(super::HTTP2_KEEP_ALIVE_TIMEOUT);
+
+        let channel = super::connect_channel(endpoint, client_tls_config, skip_tls_verification)
+            .await
+            .inspect_err(|err| {
+                error!("connect to {} failed: {}", addr, err);
+            })?;
 
         let client = HealthGRPCClient::with_interceptor(channel, InjectTracingInterceptor)
             .max_decoding_message_size(usize::MAX)

@@ -601,7 +601,12 @@ impl SchedulerClient {
             return Ok(channel.clone());
         }
 
-        let addr = format!("http://{socket_addr}");
+        let scheme = if self.config.scheduler.tls {
+            "https"
+        } else {
+            "http"
+        };
+        let addr = format!("{scheme}://{socket_addr}");
         let domain_name = Url::parse(addr.as_str())?
             .host_str()
             .ok_or(Error::InvalidParameter)
@@ -610,35 +615,46 @@ impl SchedulerClient {
             })?
             .to_string();
 
-        let endpoint = match self
-            .config
-            .scheduler
-            .load_client_tls_config(domain_name.as_str())
-            .await?
-        {
-            Some(client_tls_config) => Channel::from_shared(addr.clone())
-                .map_err(|_| Error::InvalidURI(addr.clone()))?
-                .tls_config(client_tls_config)?
-                .buffer_size(super::BUFFER_SIZE)
-                .connect_timeout(super::CONNECT_TIMEOUT)
-                .timeout(super::REQUEST_TIMEOUT)
-                .tcp_keepalive(Some(super::TCP_KEEPALIVE))
-                .http2_keep_alive_interval(super::HTTP2_KEEP_ALIVE_INTERVAL)
-                .keep_alive_timeout(super::HTTP2_KEEP_ALIVE_TIMEOUT),
-            None => Channel::from_shared(addr.clone())
-                .map_err(|_| Error::InvalidURI(addr.clone()))?
-                .buffer_size(super::BUFFER_SIZE)
-                .connect_timeout(super::CONNECT_TIMEOUT)
-                .timeout(super::REQUEST_TIMEOUT)
-                .tcp_keepalive(Some(super::TCP_KEEPALIVE))
-                .http2_keep_alive_interval(super::HTTP2_KEEP_ALIVE_INTERVAL)
-                .keep_alive_timeout(super::HTTP2_KEEP_ALIVE_TIMEOUT),
+        let skip_tls_verification =
+            self.config.scheduler.tls && self.config.scheduler.skip_tls_verification;
+        let client_tls_config = if skip_tls_verification {
+            None
+        } else {
+            self.config
+                .scheduler
+                .load_client_tls_config(domain_name.as_str())
+                .await?
         };
 
-        // Balance the requests over a pool of connections, since the scheduler
-        // limits the concurrent streams of a single connection. The connections
-        // are established on demand.
-        let channel = Channel::balance_list((0..CONNECTION_POOL_SIZE).map(|_| endpoint.clone()));
+        let endpoint = Channel::from_shared(addr.clone())
+            .map_err(|_| Error::InvalidURI(addr.clone()))?
+            .buffer_size(super::BUFFER_SIZE)
+            .connect_timeout(super::CONNECT_TIMEOUT)
+            .timeout(super::REQUEST_TIMEOUT)
+            .tcp_keepalive(Some(super::TCP_KEEPALIVE))
+            .http2_keep_alive_interval(super::HTTP2_KEEP_ALIVE_INTERVAL)
+            .keep_alive_timeout(super::HTTP2_KEEP_ALIVE_TIMEOUT);
+
+        let channel = if skip_tls_verification {
+            // ponytail: `balance_list` cannot carry the custom certificate
+            // verifier, so skipping verification also gives up the connection
+            // pool. It is a debugging aid, not a production path.
+            super::connect_channel(endpoint, None, true)
+                .await
+                .inspect_err(|err| {
+                    error!("connect to {} failed: {}", addr, err);
+                })?
+        } else {
+            let endpoint = match client_tls_config {
+                Some(client_tls_config) => endpoint.tls_config(client_tls_config)?,
+                None => endpoint,
+            };
+
+            // Balance the requests over a pool of connections, since the scheduler
+            // limits the concurrent streams of a single connection. The connections
+            // are established on demand.
+            Channel::balance_list((0..CONNECTION_POOL_SIZE).map(|_| endpoint.clone()))
+        };
 
         self.channels
             .write()

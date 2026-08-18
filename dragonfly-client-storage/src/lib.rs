@@ -207,6 +207,12 @@ impl Storage {
         self.metadata.get_tasks()
     }
 
+    /// Sets the exempt_from_gc flag on a task.
+    #[instrument(level = "debug", skip_all)]
+    pub fn set_task_gc_exempt(&self, id: &str, exempt: bool) -> Result<metadata::Task> {
+        self.metadata.set_task_gc_exempt(id, exempt)
+    }
+
     /// Deletes the task metadatas, task content and piece metadatas.
     #[instrument(level = "debug", skip_all)]
     pub async fn delete_task(&self, id: &str) {

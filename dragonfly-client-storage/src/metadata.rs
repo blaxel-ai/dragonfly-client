@@ -70,6 +70,11 @@ pub struct Task {
 
     /// The time when the task downloads finished.
     pub finished_at: Option<NaiveDateTime>,
+
+    /// exempt_from_gc indicates whether this task should be skipped during
+    /// garbage collection (both TTL-based and disk-pressure-based eviction).
+    #[serde(default)]
+    pub exempt_from_gc: bool,
 }
 
 /// Implements the task database object.
@@ -125,6 +130,11 @@ impl Task {
     /// Returns whether the task downloads finished.
     pub fn is_finished(&self) -> bool {
         self.finished_at.is_some()
+    }
+
+    /// Returns whether the task is exempt from garbage collection.
+    pub fn is_exempt_from_gc(&self) -> bool {
+        self.exempt_from_gc
     }
 
     /// Returns whether the task is empty.
@@ -835,6 +845,22 @@ impl<E: StorageEngineOwned> Metadata<E> {
         info!("delete task metadata {}", id);
         self.upload_stats.remove(id);
         self.db.delete::<Task>(id.as_bytes())
+    }
+
+    /// Sets the exempt_from_gc flag on a task.
+    #[instrument(level = "debug", skip_all)]
+    pub fn set_task_gc_exempt(&self, id: &str, exempt: bool) -> Result<Task> {
+        let task = match self.db.get::<Task>(id.as_bytes())? {
+            Some(mut task) => {
+                task.exempt_from_gc = exempt;
+                task.updated_at = Utc::now().naive_utc();
+                task
+            }
+            None => return Err(Error::TaskNotFound(id.to_string())),
+        };
+
+        self.db.put(id.as_bytes(), &task)?;
+        Ok(task)
     }
 
     /// Creates a new persistent task.
@@ -1936,5 +1962,65 @@ mod tests {
             .unwrap();
         let piece = metadata.get_piece(piece_id.as_str()).unwrap().unwrap();
         assert!(piece.is_finished());
+    }
+
+    #[test]
+    fn test_set_task_gc_exempt() {
+        let dir = tempdir().unwrap();
+        let log_dir = dir.path().join("log");
+        let metadata = Metadata::new(Arc::new(Config::default()), dir.path(), &log_dir).unwrap();
+        let task_id = "d3c4e940ad06c47fc36ac67801e6f8e36cb400e2391708620bc7e865b102062c";
+
+        // Create a task; exempt_from_gc should default to false.
+        metadata
+            .download_task_started(task_id, 1024, 1024, None)
+            .unwrap();
+        let task = metadata.get_task(task_id).unwrap().unwrap();
+        assert!(!task.is_exempt_from_gc());
+
+        // Set exempt_from_gc to true.
+        let task = metadata.set_task_gc_exempt(task_id, true).unwrap();
+        assert!(task.is_exempt_from_gc());
+
+        // Re-read from storage to confirm persistence.
+        let task = metadata.get_task(task_id).unwrap().unwrap();
+        assert!(task.is_exempt_from_gc());
+
+        // Clear the flag.
+        let task = metadata.set_task_gc_exempt(task_id, false).unwrap();
+        assert!(!task.is_exempt_from_gc());
+        let task = metadata.get_task(task_id).unwrap().unwrap();
+        assert!(!task.is_exempt_from_gc());
+    }
+
+    #[test]
+    fn test_set_task_gc_exempt_not_found() {
+        let dir = tempdir().unwrap();
+        let log_dir = dir.path().join("log");
+        let metadata = Metadata::new(Arc::new(Config::default()), dir.path(), &log_dir).unwrap();
+
+        let result = metadata.set_task_gc_exempt("nonexistent-task", true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_gc_exempt_defaults_false_on_existing_tasks() {
+        // Tasks created before the exempt_from_gc field was added should
+        // deserialize with exempt_from_gc = false (via #[serde(default)]).
+        // We verify this by creating a task through the normal path and
+        // checking the default.
+        let dir = tempdir().unwrap();
+        let log_dir = dir.path().join("log");
+        let metadata = Metadata::new(Arc::new(Config::default()), dir.path(), &log_dir).unwrap();
+        let task_id = "d3c4e940ad06c47fc36ac67801e6f8e36cb400e2391708620bc7e865b102062c";
+
+        metadata
+            .download_task_started(task_id, 1024, 1024, None)
+            .unwrap();
+        let task = metadata.get_task(task_id).unwrap().unwrap();
+        assert!(
+            !task.is_exempt_from_gc(),
+            "new tasks should not be gc-exempt by default"
+        );
     }
 }

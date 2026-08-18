@@ -15,12 +15,18 @@
  */
 
 use dragonfly_api::dfdaemon::v2::DownloadTaskRequest;
-use dragonfly_client_core::{Error as ClientError, Result as ClientResult};
+use dragonfly_client_core::{
+    error::{ErrorType, OrErr},
+    Error as ClientError, Result as ClientResult,
+};
 use dragonfly_client_metric::{
     collect_prefetch_task_failure_metrics, collect_prefetch_task_started_metrics,
 };
+use dragonfly_client_util::tls::NoVerifier;
+use std::error::Error;
 use std::path::PathBuf;
 use std::time::Duration;
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::Request;
 use tracing::{debug, error, info, instrument, Instrument};
 
@@ -72,6 +78,49 @@ pub const INITIAL_CONNECTION_WINDOW_SIZE: u32 = 4 * 1024 * 1024;
 
 /// The buffer size for download gRPC stream messages.
 pub const DOWNLOAD_STREAM_BUFFER_SIZE: usize = 12;
+
+/// Connects to an endpoint over TLS, over TLS without certificate verification,
+/// or in cleartext.
+pub async fn connect_channel(
+    endpoint: Endpoint,
+    client_tls_config: Option<ClientTlsConfig>,
+    skip_tls_verification: bool,
+) -> ClientResult<Channel> {
+    if skip_tls_verification {
+        let rustls_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(NoVerifier::new())
+            .with_no_client_auth();
+
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(rustls_config)
+            .https_only()
+            .enable_http2()
+            .build();
+
+        // `Endpoint::connect_with_connector` would wrap the connector in tonic's
+        // own TLS guard, which defeats the custom verifier, so connect the
+        // channel with the connector directly.
+        return Ok(Channel::connect(connector, endpoint)
+            .await
+            .inspect_err(|err| {
+                error!("connect without certificate verification failed: {}", err);
+                let mut source = err.source();
+                while let Some(err) = source {
+                    error!("caused by: {}", err);
+                    source = err.source();
+                }
+            })
+            .or_err(ErrorType::ConnectError)?);
+    }
+
+    let endpoint = match client_tls_config {
+        Some(client_tls_config) => endpoint.tls_config(client_tls_config)?,
+        None => endpoint,
+    };
+
+    Ok(endpoint.connect().await.or_err(ErrorType::ConnectError)?)
+}
 
 /// Prefetches the task if prefetch flag is true.
 #[instrument(skip_all)]

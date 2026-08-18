@@ -18,6 +18,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+        with:
+          submodules: true
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -56,6 +58,8 @@ jobs:
 
       - name: Checkout code
         uses: actions/checkout@v7
+        with:
+          submodules: true
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2

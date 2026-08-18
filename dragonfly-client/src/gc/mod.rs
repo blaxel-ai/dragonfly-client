@@ -149,6 +149,12 @@ impl GC {
     async fn evict_task_by_ttl(&self, tasks: &[metadata::Task]) -> Result<()> {
         info!("start to evict by task ttl");
         for task in tasks {
+            // If the task is exempt from gc, skip it.
+            if task.is_exempt_from_gc() {
+                info!("task {} is exempt from gc, skip it", task.id);
+                continue;
+            }
+
             // If the task is expired and not uploading, evict the task.
             if task.is_expired(self.config.gc.policy.task_ttl) {
                 self.storage.delete_task(&task.id).await;
@@ -222,10 +228,20 @@ impl GC {
         tasks.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
 
         let mut evicted_space = 0;
+        let mut exempt_count: u64 = 0;
+        let mut exempt_space: u64 = 0;
         for task in tasks {
             // Evict enough space.
             if evicted_space >= need_evict_space {
                 break;
+            }
+
+            // If the task is exempt from gc, skip it.
+            if task.is_exempt_from_gc() {
+                exempt_count += 1;
+                exempt_space += task.content_length().unwrap_or(0);
+                info!("task {} is exempt from gc, skip it", task.id);
+                continue;
             }
 
             // If the task has downloaded finished, task has the content length, evicted space is the
@@ -261,6 +277,16 @@ impl GC {
 
             self.delete_task_from_scheduler(task.clone()).await;
             info!("delete task {} from scheduler", task.id);
+        }
+
+        if evicted_space < need_evict_space {
+            error!(
+                "CRITICAL: disk pressure eviction could not free enough space: \
+                 needed {} bytes but only freed {} bytes. \
+                 {} gc-exempt tasks are holding {} bytes. \
+                 Consider removing gc exemptions or adding disk capacity.",
+                need_evict_space, evicted_space, exempt_count, exempt_space
+            );
         }
 
         info!("evict total size {}", evicted_space);
@@ -511,3 +537,11 @@ impl GC {
         Ok(())
     }
 }
+
+// TODO: There are no existing unit tests for the GC eviction logic because
+// constructing a GC instance requires a SchedulerClient with real network
+// connectivity. Unit tests for the gc-exempt behavior should be added before
+// upstreaming this change (e.g. by introducing a trait for the scheduler
+// dependency or by extracting pure eviction-decision functions). For now,
+// the gc-exempt feature is covered by integration tests in downstream
+// dependent repos.

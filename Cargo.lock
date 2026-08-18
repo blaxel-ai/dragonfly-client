@@ -1287,6 +1287,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dragonfly-api"
+version = "2.3.1"
+dependencies = [
+ "prost 0.14.4",
+ "prost-types",
+ "prost-wkt-types",
+ "serde",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
 name = "dragonfly-client"
 version = "1.5.1"
 dependencies = [
@@ -1298,7 +1312,7 @@ dependencies = [
  "clap",
  "console-subscriber",
  "dashmap",
- "dragonfly-api",
+ "dragonfly-api 2.3.1",
  "dragonfly-client-backend",
  "dragonfly-client-config",
  "dragonfly-client-core",
@@ -1370,7 +1384,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "dashmap",
- "dragonfly-api",
+ "dragonfly-api 2.3.1",
  "dragonfly-client-config",
  "dragonfly-client-core",
  "dragonfly-client-util",
@@ -1472,7 +1486,7 @@ name = "dragonfly-client-metric"
 version = "1.5.1"
 dependencies = [
  "bytes",
- "dragonfly-api",
+ "dragonfly-api 2.3.1",
  "dragonfly-client-config",
  "dragonfly-client-util",
  "fs2",
@@ -1493,7 +1507,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "dashmap",
- "dragonfly-api",
+ "dragonfly-api 2.3.0",
  "futures",
  "hashring",
  "hex",
@@ -1529,7 +1543,7 @@ dependencies = [
  "crc32fast",
  "criterion",
  "dashmap",
- "dragonfly-api",
+ "dragonfly-api 2.3.1",
  "dragonfly-client-config",
  "dragonfly-client-core",
  "dragonfly-client-metric",
@@ -1564,7 +1578,7 @@ dependencies = [
  "cgroups-rs",
  "crc32fast",
  "dashmap",
- "dragonfly-api",
+ "dragonfly-api 2.3.1",
  "dragonfly-client-core",
  "fs2",
  "hashring",
@@ -5823,6 +5837,7 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "pin-project",
+ "rustls-native-certs",
  "socket2 0.6.5",
  "sync_wrapper",
  "tokio",

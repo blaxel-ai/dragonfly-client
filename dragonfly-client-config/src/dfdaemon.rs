@@ -159,6 +159,13 @@ fn default_back_to_source_bandwidth_limit() -> ByteSize {
     ByteSize::gb(50)
 }
 
+/// Returns the default minimum p2p download throughput in GB/MB/KB per second, default is 0B/s,
+/// which disables the check.
+#[inline]
+fn default_min_p2p_throughput() -> ByteSize {
+    ByteSize::b(0)
+}
+
 /// Returns the default timeout for downloading a piece from source.
 #[inline]
 fn default_download_piece_timeout() -> Duration {
@@ -515,6 +522,12 @@ pub struct Download {
     )]
     pub back_to_source_bandwidth_limit: ByteSize,
 
+    /// The minimum p2p download throughput in GB/MB/KB per second. If the
+    /// throughput stays below this value after a short grace period, dfdaemon
+    /// falls back to the source.
+    #[serde(with = "bytesize_serde", default = "default_min_p2p_throughput")]
+    pub min_p2p_throughput: ByteSize,
+
     /// The timeout for downloading a piece from source.
     #[serde(default = "default_download_piece_timeout", with = "humantime_serde")]
     pub piece_timeout: Duration,
@@ -541,6 +554,7 @@ impl Default for Download {
             protocol: default_download_protocol(),
             bandwidth_limit: default_download_bandwidth_limit(),
             back_to_source_bandwidth_limit: default_back_to_source_bandwidth_limit(),
+            min_p2p_throughput: default_min_p2p_throughput(),
             piece_timeout: default_download_piece_timeout(),
             collected_piece_timeout: default_collected_download_piece_timeout(),
             concurrent_piece_count: default_download_concurrent_piece_count(),
@@ -715,6 +729,13 @@ pub struct Manager {
     /// manager.
     pub addr: Option<String>,
 
+    /// Whether to connect to the manager over TLS (https).
+    pub tls: bool,
+
+    /// Whether to skip the TLS certificate verification when connecting to the
+    /// manager.
+    pub skip_tls_verification: bool,
+
     /// The root CA cert path with PEM format for the manager, and it is used
     /// for mutual TLS.
     pub ca_cert: Option<PathBuf>,
@@ -751,6 +772,14 @@ impl Manager {
                     .domain_name(domain_name)
                     .ca_certificate(ca_cert)
                     .identity(client_identity),
+            ));
+        }
+
+        if self.tls {
+            return Ok(Some(
+                ClientTlsConfig::new()
+                    .domain_name(domain_name)
+                    .with_enabled_roots(),
             ));
         }
 
@@ -811,6 +840,13 @@ pub struct Scheduler {
     #[validate(range(min = 1))]
     pub max_schedule_count: u32,
 
+    /// Whether to connect to the scheduler over TLS (https).
+    pub tls: bool,
+
+    /// Whether to skip the TLS certificate verification when connecting to the
+    /// scheduler.
+    pub skip_tls_verification: bool,
+
     /// The root CA cert path with PEM format for the scheduler, and it is used
     /// for mutual TLS.
     pub ca_cert: Option<PathBuf>,
@@ -831,6 +867,8 @@ impl Default for Scheduler {
             announce_interval: default_scheduler_announce_interval(),
             schedule_timeout: default_scheduler_schedule_timeout(),
             max_schedule_count: default_download_max_schedule_count(),
+            tls: false,
+            skip_tls_verification: false,
             ca_cert: None,
             cert: None,
             key: None,
@@ -861,6 +899,14 @@ impl Scheduler {
                     .domain_name(domain_name)
                     .ca_certificate(ca_cert)
                     .identity(client_identity),
+            ));
+        }
+
+        if self.tls {
+            return Ok(Some(
+                ClientTlsConfig::new()
+                    .domain_name(domain_name)
+                    .with_enabled_roots(),
             ));
         }
 
@@ -1826,6 +1872,7 @@ mod tests {
             },
             "protocol": "quic",
             "bandwidthLimit": "50GB",
+            "minP2pThroughput": "10MiB",
             "pieceTimeout": "30s",
             "concurrentPieceCount": 10
         }"#;
@@ -1838,6 +1885,7 @@ mod tests {
         assert_eq!(download.server.request_rate_limit, 4000);
         assert_eq!(download.protocol, "quic".to_string());
         assert_eq!(download.bandwidth_limit, ByteSize::gb(50));
+        assert_eq!(download.min_p2p_throughput, ByteSize::mib(10));
         assert_eq!(download.piece_timeout, Duration::from_secs(30));
         assert_eq!(download.concurrent_piece_count, 10);
     }
@@ -2004,6 +2052,57 @@ mod tests {
         (ca, cert, key)
     }
 
+    #[test]
+    fn manager_tls_defaults_to_false() {
+        assert!(!Manager::default().tls);
+
+        let manager: Manager = serde_yaml::from_str("addr: http://manager:65003\n").unwrap();
+        assert!(!manager.tls);
+    }
+
+    #[test]
+    fn scheduler_tls_defaults_to_false() {
+        assert!(!Scheduler::default().tls);
+
+        let scheduler: Scheduler = serde_yaml::from_str("{}").unwrap();
+        assert!(!scheduler.tls);
+    }
+
+    #[tokio::test]
+    async fn scheduler_tls_without_certs_uses_the_system_roots() {
+        // Without certs and without `tls`, there is nothing to configure.
+        let scheduler = Scheduler::default();
+        assert!(scheduler
+            .load_client_tls_config("example.com")
+            .await
+            .unwrap()
+            .is_none());
+
+        // With `tls`, the connection is configured against the system roots.
+        let scheduler = Scheduler {
+            tls: true,
+            ..Default::default()
+        };
+        assert!(scheduler
+            .load_client_tls_config("example.com")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn manager_tls_without_certs_uses_the_system_roots() {
+        let manager = Manager {
+            tls: true,
+            ..Default::default()
+        };
+        assert!(manager
+            .load_client_tls_config("example.com")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
     #[tokio::test]
     async fn manager_load_client_tls_config_success() {
         let temp_dir = tempfile::TempDir::new().unwrap();
@@ -2020,6 +2119,7 @@ mod tests {
             ca_cert: Some(ca_path),
             cert: Some(cert_path),
             key: Some(key_path),
+            ..Default::default()
         };
 
         let result = manager.load_client_tls_config("example.com").await;

@@ -1311,6 +1311,8 @@ fn make_download_task_request(
             hdfs: None,
             hugging_face: None,
             model_scope: None,
+            // ponytail: the client has no OpenCSG backend, the field is accepted and ignored.
+            open_csg: None,
             is_prefetch: false,
             need_piece_content: false,
             force_hard_link: header::get_force_hard_link(header),
